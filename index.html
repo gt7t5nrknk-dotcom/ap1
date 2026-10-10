@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>AP1 Sierpinski 垫片</title>
+<style>
+/*页面空白为0，没有外边距，网页主体横向排列*/
+body { margin:0; display:flex; }
+#canvas { border:1px solid #333; background: #000; }
+#gui-panel { padding:10px; min-width:240px; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="gui-panel">
+  <h4>AP1 参数面板</h4>
+  <div>渲染模式:
+    <select id="modeSel">
+      <option value="points">点云 POINTS</option>
+      <option value="lines">线框 LINES</option>
+      <option value="triangles">实体 TRIANGLES</option>
+    </select>
+  </div>
+  <div>递归深度 <input type="range" id="depthSlider" min="0" max="6" value="4">
+    <span id="depthVal">4</span>
+  </div>
+  <div>点数量(混沌游戏) <input type="range" id="pointCountSlider" min="1000" max="20000" value="8000">
+    <span id="pointCountVal">8000</span>
+  </div>
+  <div>点大小 <input type="range" id="pointSizeSlider" min="1" max="10" value="2">
+    <span id="pointSizeVal">2</span>
+  </div>
+  <div>配色方案
+    <select id="colorSchemeSel">
+      <option value="0">方案1 白蓝</option>
+      <option value="1">方案2 青紫</option>
+      <option value="2">方案3 橙黄</option>
+    </select>
+  </div>
+  <div><br>键盘：1点云｜2线框｜3实体｜空格暂停动画</div>
+  <div>鼠标：左键拖拽平移，滚轮缩放</div>
+</div>
+
+<script>
+// ========== 内置工具函数 ==========
+function vec2(x,y){ return [x,y]; }
+
+function mix(a,b,t){
+    return [ a[0]*(1-t)+b[0]*t , a[1]*(1-t)+b[1]*t ];
+}
+
+function initShaders(gl, vsSource, fsSource){
+    function compileShader(gl, type, src){
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, src);
+        gl.compileShader(shader);
+        if(!gl.getShaderParameter(shader, gl.COMPILE_STATUS)){
+            console.error(gl.getShaderInfoLog(shader));
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    }
+    const vShader = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fShader = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    const program = gl.createProgram();
+    gl.attachShader(program, vShader);
+    gl.attachShader(program, fShader);
+    gl.linkProgram(program);
+    if(!gl.getProgramParameter(program, gl.LINK_STATUS)){
+        console.error(gl.getProgramInfoLog(program));
+        return null;
+    }
+    return program;
+}
+// ================ 工具函数结束 =================
+
+const canvas = document.getElementById("canvas");
+canvas.width = 600;
+canvas.height = 600;
+const gl = canvas.getContext("webgl2");
+if (!gl) alert("你的浏览器不支持WebGL2，请使用Chrome或者Edge浏览器");
+
+// UI元素
+const modeSel = document.getElementById("modeSel");
+const depthSlider = document.getElementById("depthSlider");
+const depthVal = document.getElementById("depthVal");
+const pointCountSlider = document.getElementById("pointCountSlider");
+const pointCountVal = document.getElementById("pointCountVal");
+const pointSizeSlider = document.getElementById("pointSizeSlider");
+const pointSizeVal = document.getElementById("pointSizeVal");
+const colorSchemeSel = document.getElementById("colorSchemeSel");
+
+// 全局状态
+let renderMode = "points";
+let subdivDepth = 4;
+let targetPointCount = 8000;
+let pointSize = 2.0;
+let colorScheme = 0;
+
+let animatePaused = false;
+let currentPointCount = 0;
+
+let offsetX = 0.0;
+let offsetY = 0.0;
+let scale = 1.0;
+
+let dragActive = false;
+let lastMouseX = 0;
+let lastMouseY = 0;
+
+//三套配色
+const colorSchemes = [
+  [1,1,1],
+  [0,1,1],
+  [1,0.6,0]
+];
+
+//原始大三角形 NDC坐标
+const rootTri = [
+  vec2(-1.0, -0.8),
+  vec2( 1.0, -0.8),
+  vec2( 0.0,  0.8)
+];
+
+// 顶点着色器
+const vertexShaderSource = `#version 300 es
+precision highp float;
+in vec2 aPosition;
+uniform vec2 uOffset;
+uniform float uScale;
+uniform float uPointSize;
+void main(){
+  vec2 pos = aPosition * uScale + uOffset;
+  gl_Position = vec4(pos,0.0,1.0);
+  gl_PointSize = uPointSize;
+}
+`;
+
+//片元着色器
+const fragmentShaderSource = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 fragColor;
+void main(){
+    fragColor = vec4(uColor,1.0);
+}
+`;
+
+const program = initShaders(gl, vertexShaderSource, fragmentShaderSource);
+gl.useProgram(program);
+
+const uOffsetLoc = gl.getUniformLocation(program, "uOffset");
+const uScaleLoc = gl.getUniformLocation(program, "uScale");
+const uPointSizeLoc = gl.getUniformLocation(program, "uPointSize");
+const uColorLoc = gl.getUniformLocation(program, "uColor");
+
+const vbo = gl.createBuffer();
+
+// 算法1：混沌游戏
+function chaosGame(totalPoints, tri){
+  const v = [];
+  let p = vec2( Math.random()*2-1, Math.random()*2-1 );
+  for(let i=0; i<totalPoints; i++){
+    const idx = Math.floor(Math.random()*3);
+    const vtx = tri[idx];
+    p = mix(p, vtx, 0.5);
+    v.push(p[0], p[1]);
+  }
+  return new Float32Array(v);
+}
+
+//算法2：递归细分
+function subdivide(tri, depth, out){
+  if(depth ===0){
+    out.push(tri[0][0], tri[0][1]);
+    out.push(tri[1][0], tri[1][1]);
+    out.push(tri[2][0], tri[2][1]);
+    return;
+  }
+  const a = mix(tri[0], tri[1], 0.5);
+  const b = mix(tri[1], tri[2], 0.5);
+  const c = mix(tri[2], tri[0], 0.5);
+  subdivide([tri[0], a, c], depth-1, out);
+  subdivide([a, tri[1], b], depth-1, out);
+  subdivide([c, b, tri[2]], depth-1, out);
+}
+
+function getSubdivideData(depth){
+  const arr = [];
+  subdivide(rootTri, depth, arr);
+  return new Float32Array(arr);
+}
+
+//渲染一帧
+function render(){
+  gl.viewport(0,0,canvas.width, canvas.height);
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.uniform2f(uOffsetLoc, offsetX, offsetY);
+  gl.uniform1f(uScaleLoc, scale);
+  gl.uniform1f(uPointSizeLoc, pointSize);
+  const cs = colorSchemes[colorScheme];
+  gl.uniform3f(uColorLoc, cs[0],cs[1],cs[2]);
+
+  let vertexData;
+  let drawMode;
+
+  if(renderMode === "points"){
+    const full = chaosGame(targetPointCount, rootTri);
+    const used = full.subarray(0, currentPointCount*2);
+    vertexData = used;
+    drawMode = gl.POINTS;
+  }else{
+    vertexData = getSubdivideData(subdivDepth);
+    if(renderMode === "lines") drawMode = gl.LINES;
+    else drawMode = gl.TRIANGLES;
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, vertexData, gl.DYNAMIC_DRAW);
+
+  const aPosLoc = gl.getAttribLocation(program, "aPosition");
+  gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0,0);
+  gl.enableVertexAttribArray(aPosLoc);
+
+  const count = vertexData.length / 2;
+  gl.drawArrays(drawMode, 0, count);
+}
+
+function animateLoop(){
+  if(!animatePaused && renderMode === "points"){
+    if(currentPointCount < targetPointCount){
+      currentPointCount += 20;
+    }
+  }
+  render();
+  requestAnimationFrame(animateLoop);
+}
+
+//UI事件绑定
+modeSel.onchange = ()=>{
+  renderMode = modeSel.value;
+  currentPointCount = 0;
+};
+
+depthSlider.oninput = ()=>{
+  subdivDepth = Number(depthSlider.value);
+  depthVal.innerText = subdivDepth;
+};
+
+pointCountSlider.oninput = ()=>{
+  targetPointCount = Number(pointCountSlider.value);
+  pointCountVal.innerText = targetPointCount;
+  currentPointCount = 0;
+};
+
+pointSizeSlider.oninput = ()=>{
+  pointSize = Number(pointSizeSlider.value);
+  pointSizeVal.innerText = pointSize;
+};
+
+colorSchemeSel.onchange = ()=>{
+  colorScheme = Number(colorSchemeSel.value);
+};
+
+//鼠标拖拽
+canvas.addEventListener("mousedown", e=>{
+  dragActive = true;
+  lastMouseX = e.clientX;
+  lastMouseY = e.clientY;
+});
+
+window.addEventListener("mousemove", e=>{
+  if(!dragActive) return;
+  const dx = (e.clientX - lastMouseX)/canvas.width *2.0;
+  const dy = -(e.clientY - lastMouseY)/canvas.height *2.0;
+  offsetX += dx;
+  offsetY += dy;
+  lastMouseX = e.clientX;
+  lastMouseY = e.clientY;
+});
+
+window.addEventListener("mouseup", ()=> dragActive = false);
+
+//滚轮缩放
+canvas.addEventListener("wheel", e=>{
+  e.preventDefault();
+  const factor = e.deltaY>0 ? 0.9 : 1.1;
+  scale *= factor;
+});
+
+//全局键盘监听，整个页面任意位置都能触发快捷键
+document.addEventListener("keydown", e=>{
+  switch(e.key){
+    case "1": renderMode="points"; modeSel.value="points"; currentPointCount=0; break;
+    case "2": renderMode="lines"; modeSel.value="lines"; break;
+    case "3": renderMode="triangles"; modeSel.value="triangles"; break;
+    case " ":
+      e.preventDefault();
+      animatePaused = !animatePaused;
+      break;
+  }
+});
+
+animateLoop();
+</script>
+</body>
+</html>
